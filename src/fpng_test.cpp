@@ -1072,8 +1072,10 @@ int main(int arg_c, char **arg_v)
 
 	if (!csv_flag)
 	{
+#ifdef FPNG_X86_OR_X64_CPU
 		printf("SSE 4.1 supported: %u\n", fpng::fpng_cpu_supports_sse41());
-
+		printf("AVX 2 supported: %u\n", fpng::fpng_cpu_supports_avx2());
+#endif
 		printf("Filename: %s\n", pFilename);
 		if (pAlpha_filename)
 			printf("Alpha filename: %s\n", pFilename);

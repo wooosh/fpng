@@ -41,6 +41,7 @@
 	#include <emmintrin.h>		// SSE2
 	#include <smmintrin.h>		// SSE4.1
 	#include <wmmintrin.h>		// pclmul
+	#include <immintrin.h>    // AVX, AVX2
 #endif
 
 #ifndef FPNG_NO_STDIO
@@ -355,6 +356,7 @@ namespace fpng
 		}
 
 		bool can_use_sse41() const { return m_has_sse && m_has_sse2 && m_has_sse3 && m_has_ssse3 && m_has_sse41; }
+		bool can_use_avx2() const { return m_has_avx && m_has_avx2 && can_use_sse41(); }
 		bool can_use_pclmul() const	{ return m_has_pclmulqdq && can_use_sse41(); }
 
 	private:
@@ -400,7 +402,90 @@ namespace fpng
 		return crc32_slice_by_4(pData, size, prev_crc32);
 	}
 
-#if FPNG_X86_OR_X64_CPU && !FPNG_NO_SSE 
+	static inline uint32_t sum256_epi32(__m256i v) {
+		__m128i sum128 = _mm_add_epi32(
+			_mm256_castsi256_si128(v),
+			_mm256_extracti128_si256(v, 1)
+		);
+		__m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+		__m128i sum64 = _mm_add_epi32(hi64, sum128);
+		__m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+		__m128i sum32 = _mm_add_epi32(sum64, hi32);
+		return _mm_cvtsi128_si32(sum32);
+	}
+
+#if FPNG_X86_OR_X64_CPU
+#if !FPNG_NO_AVX2
+	static uint32_t adler32_avx2_64(const uint8_t* p, size_t len, uint32_t initial) {
+		const uint32_t max_chunk_len = (5552/64)*64;
+		const __m256i zero_v = _mm256_setzero_si256();
+		const __m256i one_epi16_v = _mm256_set1_epi16(1);
+		const __m256i coeff1_v = _mm256_set_epi8(
+			33, 34, 35, 36, 37, 38, 39, 40,
+			41, 42, 43, 44, 45, 46, 47, 48,
+			49, 50, 51, 52, 53, 54, 55, 56,
+			57, 58, 59, 60, 61, 62, 63, 64
+		);
+		const __m256i coeff2_v = _mm256_set_epi8(
+			 1,  2,  3,  4,  5,  6,  7,  8,
+			 9, 10, 11, 12, 13, 14, 15, 16,
+			17, 18, 19, 20, 21, 22, 23, 24,
+			25, 26, 27, 28, 29, 30, 31, 32
+		);
+
+		uint32_t sum  = initial & 0xFFFF;
+		uint32_t sum2 = initial >> 16;
+
+		while (len >= 64)
+		{
+			size_t chunk_len = len;
+			chunk_len = (chunk_len/64)*64;
+			if (chunk_len > max_chunk_len)
+				chunk_len = max_chunk_len;
+			len -= chunk_len;
+
+			__m256i p_sum_v = _mm256_setzero_si256();
+			__m256i sum_v = _mm256_setzero_si256();
+			__m256i sum2_v = _mm256_setzero_si256();
+
+			const uint8_t *chunk_end = p + chunk_len;
+			while (p < chunk_end)
+			{
+				p_sum_v = _mm256_add_epi64(p_sum_v, sum_v);
+
+				__m256i chunk1_v = _mm256_loadu_si256((const __m256i_u *)p);
+				__m256i chunk2_v = _mm256_loadu_si256((const __m256i_u *)(p+32));
+				p += 64;
+
+				__m256i m16_1_v = _mm256_maddubs_epi16(chunk1_v, coeff1_v);
+				__m256i m16_2_v = _mm256_maddubs_epi16(chunk2_v, coeff2_v);
+
+				sum2_v = _mm256_add_epi32(sum2_v, _mm256_madd_epi16(m16_1_v, one_epi16_v));
+				sum2_v = _mm256_add_epi32(sum2_v, _mm256_madd_epi16(m16_2_v, one_epi16_v));
+
+				sum_v = _mm256_add_epi32(sum_v, _mm256_sad_epu8(chunk1_v, zero_v));
+				sum_v = _mm256_add_epi32(sum_v, _mm256_sad_epu8(chunk2_v, zero_v));
+			}
+
+			sum2_v = _mm256_add_epi32(sum2_v, _mm256_slli_epi32(p_sum_v, 6));
+			sum2 += sum * chunk_len + sum256_epi32(sum2_v);
+			sum += sum256_epi32(sum_v);
+
+			sum %= 65521;
+			sum2 %= 65521;
+		}
+
+		for (; len; len--)
+		{
+			sum += *p++;
+			sum2 += sum;
+		}
+
+		return (sum % 65521) | ((sum2 % 65521) << 16);
+	}
+#endif
+
+#if !FPNG_NO_SSE
 	// See "Fast Computation of Adler32 Checksums":
 	// https://www.intel.com/content/www/us/en/developer/articles/technical/fast-computation-of-adler32-checksums.html
 	// SSE 4.1, 16 bytes per iteration
@@ -461,7 +546,7 @@ namespace fpng
 		return (s1 % K) | ((s2 % K) << 16);
 	}
 #endif
-
+#endif
 	static uint32_t fpng_adler32_scalar(const uint8_t* ptr, size_t buf_len, uint32_t adler)
 	{
 		uint32_t i, s1 = (uint32_t)(adler & 0xffff), s2 = (uint32_t)(adler >> 16); uint32_t block_len = (uint32_t)(buf_len % 5552);
@@ -479,9 +564,15 @@ namespace fpng
 
 	uint32_t fpng_adler32(const void* pData, size_t size, uint32_t adler)
 	{
-#if FPNG_X86_OR_X64_CPU && !FPNG_NO_SSE 
+#if FPNG_X86_OR_X64_CPU
+#if !FPNG_NO_AVX2
+		if (g_cpu_info.can_use_avx2())
+			return adler32_avx2_64((const uint8_t *)pData, size, adler);
+#endif
+#if !FPNG_NO_SSE
 		if (g_cpu_info.can_use_sse41())
 			return adler32_sse_16((const uint8_t*)pData, size, adler);
+#endif
 #endif
 		return fpng_adler32_scalar((const uint8_t*)pData, size, adler);
 	}
